@@ -15,7 +15,7 @@ A YouTube Data API v3 skill for OpenClaw/Clawdbot. Search videos, get channel in
 
 ### 1. Clone this repo
 ```bash
-git clone https://github.com/YOUR_USERNAME/youtube-skill.git
+git clone https://github.com/zzunebye/youtube-skill.git
 ```
 
 ### 2. Add to your PATH

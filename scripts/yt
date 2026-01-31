@@ -2,9 +2,12 @@
 """YouTube Data API v3 CLI with OAuth support"""
 
 import argparse
+import getpass
 import json
 import os
+import secrets
 import sys
+import time
 import webbrowser
 import http.server
 import urllib.parse
@@ -46,10 +49,11 @@ def load_token():
         return json.load(f)
 
 def save_token(token):
-    """Save OAuth token to file"""
-    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    """Save OAuth token to file with secure permissions"""
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with open(TOKEN_FILE, "w") as f:
         json.dump(token, f)
+    os.chmod(TOKEN_FILE, 0o600)
 
 def refresh_token(token, credentials):
     """Refresh expired access token"""
@@ -59,25 +63,38 @@ def refresh_token(token, credentials):
         "refresh_token": token["refresh_token"],
         "grant_type": "refresh_token"
     }).encode()
-    
+
     req = Request(OAUTH_TOKEN_URL, data=data, method="POST")
-    with urlopen(req) as resp:
-        new_token = json.loads(resp.read().decode())
-        token["access_token"] = new_token["access_token"]
-        if "refresh_token" in new_token:
-            token["refresh_token"] = new_token["refresh_token"]
-        save_token(token)
-        return token
+    try:
+        with urlopen(req) as resp:
+            new_token = json.loads(resp.read().decode())
+            token["access_token"] = new_token["access_token"]
+            if "refresh_token" in new_token:
+                token["refresh_token"] = new_token["refresh_token"]
+            if "expires_in" in new_token:
+                token["expires_at"] = int(time.time()) + new_token["expires_in"]
+            save_token(token)
+            return token
+    except (HTTPError, json.JSONDecodeError) as e:
+        print(f"Token refresh failed: {e}", file=sys.stderr)
+        return None
 
 def get_oauth_token():
     """Get valid OAuth token, refreshing if needed"""
     token = load_token()
     credentials = load_credentials()
-    
+
     if not token or not credentials:
         return None
-    
-    # Try to use token, refresh if expired
+
+    # Check if token is expired or about to expire (within 5 minutes)
+    expires_at = token.get("expires_at", 0)
+    if expires_at and int(time.time()) >= expires_at - 300:
+        refreshed = refresh_token(token, credentials)
+        if refreshed:
+            return refreshed
+        return None
+
     return token
 
 def api_request(endpoint, params, use_oauth=False):
@@ -101,21 +118,31 @@ def api_request(endpoint, params, use_oauth=False):
         req = Request(url, headers=headers)
         with urlopen(req) as resp:
             return json.loads(resp.read().decode())
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse API response: {e}", file=sys.stderr)
+        sys.exit(1)
     except HTTPError as e:
         if e.code == 401 and token:
             # Try refreshing token
             credentials = load_credentials()
             if credentials:
                 try:
-                    token = refresh_token(token, credentials)
-                    headers["Authorization"] = f"Bearer {token['access_token']}"
-                    req = Request(url, headers=headers)
-                    with urlopen(req) as resp:
-                        return json.loads(resp.read().decode())
-                except:
-                    pass
+                    refreshed = refresh_token(token, credentials)
+                    if refreshed:
+                        headers["Authorization"] = f"Bearer {refreshed['access_token']}"
+                        req = Request(url, headers=headers)
+                        with urlopen(req) as resp:
+                            return json.loads(resp.read().decode())
+                except (HTTPError, json.JSONDecodeError) as refresh_err:
+                    print(f"Token refresh failed: {refresh_err}", file=sys.stderr)
         error_body = e.read().decode()
-        print(f"API Error ({e.code}): {error_body}", file=sys.stderr)
+        # Sanitize error output to avoid leaking sensitive info
+        try:
+            error_json = json.loads(error_body)
+            error_msg = error_json.get("error", {}).get("message", "Unknown error")
+            print(f"API Error ({e.code}): {error_msg}", file=sys.stderr)
+        except json.JSONDecodeError:
+            print(f"API Error ({e.code}): Request failed", file=sys.stderr)
         sys.exit(1)
 
 def format_duration(iso_duration):
@@ -157,30 +184,33 @@ def cmd_auth(args):
         print("Or paste your client_id and client_secret below:\n")
         
         client_id = input("Client ID: ").strip()
-        client_secret = input("Client Secret: ").strip()
-        
+        client_secret = getpass.getpass("Client Secret: ").strip()
+
         if not client_id or not client_secret:
             print("Error: Both client_id and client_secret required")
             sys.exit(1)
-        
+
         credentials = {
             "client_id": client_id,
             "client_secret": client_secret
         }
-        CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with open(CREDENTIALS_FILE, "w") as f:
             json.dump(credentials, f)
+        os.chmod(CREDENTIALS_FILE, 0o600)
         print(f"\n✓ Credentials saved to {CREDENTIALS_FILE}")
     
-    # Start OAuth flow
+    # Start OAuth flow with CSRF protection
     redirect_uri = "http://localhost:8765"
+    csrf_state = secrets.token_urlsafe(32)
     auth_params = {
         "client_id": credentials["client_id"],
         "redirect_uri": redirect_uri,
         "response_type": "code",
         "scope": " ".join(SCOPES),
         "access_type": "offline",
-        "prompt": "consent"
+        "prompt": "consent",
+        "state": csrf_state
     }
     
     auth_url = f"{OAUTH_AUTH_URL}?{urlencode(auth_params)}"
@@ -190,15 +220,26 @@ def cmd_auth(args):
     
     # Simple HTTP server to catch the callback
     auth_code = None
-    
+    state_valid = False
+
     class CallbackHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            nonlocal auth_code
+            nonlocal auth_code, state_valid
             query = urllib.parse.urlparse(self.path).query
             params = urllib.parse.parse_qs(query)
-            
+
+            # Validate CSRF state parameter
+            received_state = params.get("state", [None])[0]
+            if received_state != csrf_state:
+                self.send_response(400)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<html><body><h1>Error</h1><p>Invalid state parameter (CSRF protection).</p></body></html>")
+                return
+
             if "code" in params:
                 auth_code = params["code"][0]
+                state_valid = True
                 self.send_response(200)
                 self.send_header("Content-type", "text/html")
                 self.end_headers()
@@ -208,7 +249,7 @@ def cmd_auth(args):
                 self.send_header("Content-type", "text/html")
                 self.end_headers()
                 self.wfile.write(b"<html><body><h1>Error</h1><p>No authorization code received.</p></body></html>")
-        
+
         def log_message(self, format, *args):
             pass  # Suppress logging
     
@@ -216,8 +257,8 @@ def cmd_auth(args):
     print("Waiting for authentication...")
     server.handle_request()
     
-    if not auth_code:
-        print("Error: No authorization code received")
+    if not auth_code or not state_valid:
+        print("Error: No authorization code received or CSRF validation failed")
         sys.exit(1)
     
     # Exchange code for token
@@ -233,11 +274,23 @@ def cmd_auth(args):
     try:
         with urlopen(req) as resp:
             token = json.loads(resp.read().decode())
+            # Store expiry time for proactive refresh
+            if "expires_in" in token:
+                token["expires_at"] = int(time.time()) + token["expires_in"]
             save_token(token)
             print("\n✓ Authentication successful!")
             print("You can now use commands that require OAuth (liked, subscriptions, etc.)")
+    except json.JSONDecodeError as e:
+        print(f"Error parsing token response: {e}", file=sys.stderr)
+        sys.exit(1)
     except HTTPError as e:
-        print(f"Error exchanging code for token: {e.read().decode()}")
+        error_body = e.read().decode()
+        try:
+            error_json = json.loads(error_body)
+            error_msg = error_json.get("error_description", "Unknown error")
+            print(f"Error exchanging code for token: {error_msg}", file=sys.stderr)
+        except json.JSONDecodeError:
+            print(f"Error exchanging code for token: Request failed", file=sys.stderr)
         sys.exit(1)
 
 def cmd_search(args):

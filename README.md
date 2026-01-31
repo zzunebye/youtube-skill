@@ -19,9 +19,26 @@ git clone https://github.com/zzunebye/youtube-skill.git
 ```
 
 ### 2. Add to your PATH
+
+**Option A: Homebrew bin (recommended for macOS)**
 ```bash
 chmod +x youtube-skill/scripts/yt
-ln -s $(pwd)/youtube-skill/scripts/yt /usr/local/bin/yt
+ln -s $(pwd)/youtube-skill/scripts/yt /opt/homebrew/bin/yt
+```
+
+**Option B: Home bin folder**
+```bash
+chmod +x youtube-skill/scripts/yt
+mkdir -p ~/bin
+ln -s $(pwd)/youtube-skill/scripts/yt ~/bin/yt
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+**Option C: Alias**
+```bash
+echo 'alias yt="python3 $(pwd)/youtube-skill/scripts/yt"' >> ~/.zshrc
+source ~/.zshrc
 ```
 
 ### 3. Set up API Key

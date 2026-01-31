@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""YouTube Data API v3 CLI"""
+
+import argparse
+import json
+import os
+import sys
+from urllib.request import urlopen, Request
+from urllib.parse import urlencode, quote_plus
+from urllib.error import HTTPError
+
+API_BASE = "https://www.googleapis.com/youtube/v3"
+
+def get_api_key():
+    key = os.environ.get("YOUTUBE_API_KEY")
+    if not key:
+        print("Error: YOUTUBE_API_KEY environment variable not set", file=sys.stderr)
+        sys.exit(1)
+    return key
+
+def api_request(endpoint, params):
+    params["key"] = get_api_key()
+    url = f"{API_BASE}/{endpoint}?{urlencode(params)}"
+    try:
+        req = Request(url, headers={"Accept": "application/json"})
+        with urlopen(req) as resp:
+            return json.loads(resp.read().decode())
+    except HTTPError as e:
+        error_body = e.read().decode()
+        print(f"API Error ({e.code}): {error_body}", file=sys.stderr)
+        sys.exit(1)
+
+def format_duration(iso_duration):
+    """Convert ISO 8601 duration to human readable"""
+    import re
+    match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', iso_duration)
+    if not match:
+        return iso_duration
+    h, m, s = match.groups()
+    parts = []
+    if h: parts.append(f"{h}h")
+    if m: parts.append(f"{m}m")
+    if s: parts.append(f"{s}s")
+    return " ".join(parts) if parts else "0s"
+
+def format_number(n):
+    """Format large numbers with K/M/B suffixes"""
+    n = int(n)
+    if n >= 1_000_000_000:
+        return f"{n/1_000_000_000:.1f}B"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}K"
+    return str(n)
+
+def cmd_search(args):
+    params = {
+        "part": "snippet",
+        "q": args.query,
+        "maxResults": args.max,
+        "type": args.type,
+    }
+    if args.region:
+        params["regionCode"] = args.region
+    
+    data = api_request("search", params)
+    
+    if args.json:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+    
+    for item in data.get("items", []):
+        snippet = item["snippet"]
+        kind = item["id"]["kind"].split("#")[1]
+        
+        if kind == "video":
+            vid = item["id"]["videoId"]
+            print(f"🎬 {snippet['title']}")
+            print(f"   Channel: {snippet['channelTitle']}")
+            print(f"   URL: https://youtube.com/watch?v={vid}")
+        elif kind == "channel":
+            cid = item["id"]["channelId"]
+            print(f"📺 {snippet['title']}")
+            print(f"   {snippet.get('description', '')[:100]}")
+            print(f"   URL: https://youtube.com/channel/{cid}")
+        elif kind == "playlist":
+            pid = item["id"]["playlistId"]
+            print(f"📋 {snippet['title']}")
+            print(f"   Channel: {snippet['channelTitle']}")
+            print(f"   URL: https://youtube.com/playlist?list={pid}")
+        print()
+
+def cmd_video(args):
+    parts = ["snippet", "contentDetails"]
+    if args.stats:
+        parts.append("statistics")
+    
+    params = {
+        "part": ",".join(parts),
+        "id": args.video_id,
+    }
+    
+    data = api_request("videos", params)
+    
+    if args.json:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+    
+    if not data.get("items"):
+        print("Video not found", file=sys.stderr)
+        sys.exit(1)
+    
+    item = data["items"][0]
+    snippet = item["snippet"]
+    details = item["contentDetails"]
+    
+    print(f"🎬 {snippet['title']}")
+    print(f"Channel: {snippet['channelTitle']}")
+    print(f"Published: {snippet['publishedAt'][:10]}")
+    print(f"Duration: {format_duration(details['duration'])}")
+    print(f"URL: https://youtube.com/watch?v={args.video_id}")
+    
+    if args.stats and "statistics" in item:
+        stats = item["statistics"]
+        print(f"\n📊 Stats:")
+        print(f"   Views: {format_number(stats.get('viewCount', 0))}")
+        print(f"   Likes: {format_number(stats.get('likeCount', 0))}")
+        print(f"   Comments: {format_number(stats.get('commentCount', 0))}")
+    
+    print(f"\n📝 Description:\n{snippet.get('description', '')[:500]}")
+    
+    if args.comments:
+        print("\n💬 Top Comments:")
+        cmd_comments_internal(args.video_id, 5, False, False)
+
+def cmd_comments_internal(video_id, max_results, include_replies, as_json):
+    params = {
+        "part": "snippet",
+        "videoId": video_id,
+        "maxResults": max_results,
+        "order": "relevance",
+    }
+    
+    data = api_request("commentThreads", params)
+    
+    if as_json:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+    
+    for item in data.get("items", []):
+        comment = item["snippet"]["topLevelComment"]["snippet"]
+        print(f"  @{comment['authorDisplayName']}: {comment['textDisplay'][:200]}")
+        if include_replies and item["snippet"]["totalReplyCount"] > 0:
+            print(f"    └ {item['snippet']['totalReplyCount']} replies")
+
+def cmd_comments(args):
+    if args.json:
+        params = {
+            "part": "snippet,replies" if args.replies else "snippet",
+            "videoId": args.video_id,
+            "maxResults": args.max,
+            "order": "relevance",
+        }
+        data = api_request("commentThreads", params)
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+    
+    print(f"💬 Comments for video {args.video_id}:\n")
+    cmd_comments_internal(args.video_id, args.max, args.replies, False)
+
+def cmd_channel(args):
+    # Handle @handle format
+    channel_id = args.channel_id
+    if channel_id.startswith("@"):
+        # Search for channel by handle
+        search_params = {
+            "part": "snippet",
+            "q": channel_id,
+            "type": "channel",
+            "maxResults": 1,
+        }
+        search_data = api_request("search", search_params)
+        if not search_data.get("items"):
+            print(f"Channel {channel_id} not found", file=sys.stderr)
+            sys.exit(1)
+        channel_id = search_data["items"][0]["id"]["channelId"]
+    
+    parts = ["snippet", "statistics", "contentDetails"]
+    params = {
+        "part": ",".join(parts),
+        "id": channel_id,
+    }
+    
+    data = api_request("channels", params)
+    
+    if args.json and not args.videos and not args.playlists:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+    
+    if not data.get("items"):
+        print("Channel not found", file=sys.stderr)
+        sys.exit(1)
+    
+    item = data["items"][0]
+    snippet = item["snippet"]
+    stats = item["statistics"]
+    
+    print(f"📺 {snippet['title']}")
+    if snippet.get("customUrl"):
+        print(f"Handle: {snippet['customUrl']}")
+    print(f"Subscribers: {format_number(stats.get('subscriberCount', 0))}")
+    print(f"Total Views: {format_number(stats.get('viewCount', 0))}")
+    print(f"Videos: {stats.get('videoCount', 0)}")
+    print(f"URL: https://youtube.com/channel/{channel_id}")
+    print(f"\n{snippet.get('description', '')[:300]}")
+    
+    if args.videos:
+        uploads_id = item["contentDetails"]["relatedPlaylists"]["uploads"]
+        print(f"\n🎬 Recent Videos:")
+        playlist_params = {
+            "part": "snippet",
+            "playlistId": uploads_id,
+            "maxResults": args.max if hasattr(args, 'max') else 10,
+        }
+        playlist_data = api_request("playlistItems", playlist_params)
+        for pitem in playlist_data.get("items", []):
+            psnippet = pitem["snippet"]
+            vid = psnippet["resourceId"]["videoId"]
+            print(f"  • {psnippet['title']}")
+            print(f"    https://youtube.com/watch?v={vid}")
+    
+    if args.playlists:
+        print(f"\n📋 Playlists:")
+        pl_params = {
+            "part": "snippet",
+            "channelId": channel_id,
+            "maxResults": 10,
+        }
+        pl_data = api_request("playlists", pl_params)
+        for pitem in pl_data.get("items", []):
+            print(f"  • {pitem['snippet']['title']}")
+            print(f"    https://youtube.com/playlist?list={pitem['id']}")
+
+def cmd_playlist(args):
+    params = {
+        "part": "snippet",
+        "playlistId": args.playlist_id,
+        "maxResults": args.max,
+    }
+    
+    data = api_request("playlistItems", params)
+    
+    if args.json:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+    
+    print(f"📋 Playlist items:\n")
+    for i, item in enumerate(data.get("items", []), 1):
+        snippet = item["snippet"]
+        vid = snippet["resourceId"]["videoId"]
+        print(f"{i}. {snippet['title']}")
+        print(f"   https://youtube.com/watch?v={vid}")
+
+def cmd_trending(args):
+    params = {
+        "part": "snippet,statistics",
+        "chart": "mostPopular",
+        "maxResults": args.max if hasattr(args, 'max') else 10,
+    }
+    if args.region:
+        params["regionCode"] = args.region
+    if args.category:
+        category_map = {
+            "music": "10",
+            "gaming": "20",
+            "news": "25",
+            "movies": "30",
+            "sports": "17",
+            "tech": "28",
+        }
+        if args.category in category_map:
+            params["videoCategoryId"] = category_map[args.category]
+    
+    data = api_request("videos", params)
+    
+    if args.json:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+    
+    region = args.region or "US"
+    print(f"🔥 Trending in {region}:\n")
+    for i, item in enumerate(data.get("items", []), 1):
+        snippet = item["snippet"]
+        stats = item.get("statistics", {})
+        print(f"{i}. {snippet['title']}")
+        print(f"   Channel: {snippet['channelTitle']}")
+        print(f"   Views: {format_number(stats.get('viewCount', 0))}")
+        print(f"   https://youtube.com/watch?v={item['id']}")
+        print()
+
+def main():
+    parser = argparse.ArgumentParser(description="YouTube Data API v3 CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    # Search
+    search_p = subparsers.add_parser("search", help="Search YouTube")
+    search_p.add_argument("query", help="Search query")
+    search_p.add_argument("--max", type=int, default=10, help="Max results")
+    search_p.add_argument("--type", default="video", choices=["video", "channel", "playlist"])
+    search_p.add_argument("--region", help="Region code (e.g., KR, US)")
+    search_p.add_argument("--json", action="store_true", help="JSON output")
+    search_p.set_defaults(func=cmd_search)
+    
+    # Video
+    video_p = subparsers.add_parser("video", help="Get video details")
+    video_p.add_argument("video_id", help="Video ID")
+    video_p.add_argument("--stats", action="store_true", help="Include statistics")
+    video_p.add_argument("--comments", action="store_true", help="Include top comments")
+    video_p.add_argument("--json", action="store_true", help="JSON output")
+    video_p.set_defaults(func=cmd_video)
+    
+    # Comments
+    comments_p = subparsers.add_parser("comments", help="Get video comments")
+    comments_p.add_argument("video_id", help="Video ID")
+    comments_p.add_argument("--max", type=int, default=20, help="Max results")
+    comments_p.add_argument("--replies", action="store_true", help="Include replies")
+    comments_p.add_argument("--json", action="store_true", help="JSON output")
+    comments_p.set_defaults(func=cmd_comments)
+    
+    # Channel
+    channel_p = subparsers.add_parser("channel", help="Get channel info")
+    channel_p.add_argument("channel_id", help="Channel ID or @handle")
+    channel_p.add_argument("--videos", action="store_true", help="List recent videos")
+    channel_p.add_argument("--playlists", action="store_true", help="List playlists")
+    channel_p.add_argument("--max", type=int, default=10, help="Max videos/playlists")
+    channel_p.add_argument("--json", action="store_true", help="JSON output")
+    channel_p.set_defaults(func=cmd_channel)
+    
+    # Playlist
+    playlist_p = subparsers.add_parser("playlist", help="List playlist items")
+    playlist_p.add_argument("playlist_id", help="Playlist ID")
+    playlist_p.add_argument("--max", type=int, default=50, help="Max results")
+    playlist_p.add_argument("--json", action="store_true", help="JSON output")
+    playlist_p.set_defaults(func=cmd_playlist)
+    
+    # Trending
+    trending_p = subparsers.add_parser("trending", help="Get trending videos")
+    trending_p.add_argument("--region", default="US", help="Region code")
+    trending_p.add_argument("--category", choices=["music", "gaming", "news", "movies", "sports", "tech"])
+    trending_p.add_argument("--max", type=int, default=10, help="Max results")
+    trending_p.add_argument("--json", action="store_true", help="JSON output")
+    trending_p.set_defaults(func=cmd_trending)
+    
+    args = parser.parse_args()
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
